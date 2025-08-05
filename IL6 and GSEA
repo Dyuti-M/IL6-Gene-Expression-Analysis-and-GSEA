@@ -1,0 +1,833 @@
+
+import os
+from pathlib import Path
+import GEOparse
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import logging
+import gseapy as gp
+import warnings
+from scipy.stats import ttest_ind, pearsonr, spearmanr, linregress
+from scipy import stats
+import matplotlib.patches as mpatches
+import traceback
+from tqdm import tqdm
+
+# --- Global Configuration and Setup ---
+
+warnings.filterwarnings("ignore")
+# Configure logging to provide informative messages
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# List of Gene Expression Omnibus (GEO) dataset IDs to analyze
+GSE_IDS = ["GSE28146", "GSE2164", "GSE122063", "GSE97151", "GSE73177", "GSE55235"] 
+    
+
+# Define directory paths for data and results
+DATA_DIR = Path("data")
+OUTPUT_DIR = Path("analysis_output")
+GSEA_OUTPUT_DIR = Path("gsea_results")
+
+# Ensure GSEA output directory exists
+GSEA_OUTPUT_DIR.mkdir(exist_ok=True)
+
+class IL6Analyzer:
+    """
+    A class to perform a multi-dataset analysis of IL-6 expression.
+    """
+    def __init__(self):
+        self.setup_directories()
+        self.il6_data = [] # List to hold individual dataset results (IL6 expression + metadata)
+        self.combined_data = None
+        self.all_expression_data = {} # Updated to store full expression data per dataset
+        self.dataset_gse_objects = {} # Store GSE objects to access platform info later
+
+    def setup_directories(self):
+        """Create necessary directories if they don't exist."""
+        DATA_DIR.mkdir(exist_ok=True)
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        GSEA_OUTPUT_DIR.mkdir(exist_ok=True)
+
+    def get_il6_probes(self, platform):
+        """
+        Extract IL-6 related probes from platform annotation.
+        This method searches for "IL6" and "IL-6" in common gene symbol columns.
+        """
+        gene_symbol_cols = [col for col in platform.table.columns
+                            if 'symbol' in col.lower() or 'gene' in col.lower()]
+
+        for col in gene_symbol_cols:
+            try:
+                il6_probes = platform.table[
+                    platform.table[col].astype(str).str.contains(r'\bIL6\b|\bIL-6\b',
+                                                                 case=False, na=False, regex=True)
+                ]
+                if not il6_probes.empty:
+                    logger.info(f"Found {len(il6_probes)} IL6 probes using column '{col}'")
+                    return il6_probes
+            except Exception as e:
+                logger.warning(f"Error searching for IL6 probes in column {col}: {e}")
+                continue
+
+        logger.warning("No IL6 probes found in platform annotation")
+        return pd.DataFrame()
+
+    def infer_sex_from_expression(self, expression_data, metadata):
+        """
+        Infer sex from expression of sex-linked genes (XIST, RPS4Y, DBY) if sex metadata is missing.
+        This method is specifically tailored to the Affymetrix platform probe IDs.
+        """
+        sex_marker_probes = {
+            "XIST": "38446_at",
+            "RPS4Y": "41214_at",
+            "DBY": "38355_at"
+        }
+
+        available_markers = {k: v for k, v in sex_marker_probes.items()
+                             if v in expression_data.index}
+
+        if not available_markers:
+            logger.warning("No sex marker probes found in expression data")
+            return
+
+        marker_expr = expression_data.loc[list(available_markers.values())].T.copy()
+        marker_expr.columns = list(available_markers.keys())
+
+        # Use median as a simple threshold for expression
+        thresholds = {marker: marker_expr[marker].quantile(0.5)
+                      for marker in available_markers.keys()}
+
+        def infer_sex(row):
+            if 'XIST' in row and 'RPS4Y' in row:
+                if row["XIST"] > thresholds['XIST'] and row["RPS4Y"] < thresholds['RPS4Y']:
+                    return "Female"
+                elif row["RPS4Y"] > thresholds['RPS4Y']:
+                    return "Male"
+            # Fallback for datasets with only DBY
+            elif 'DBY' in row and row["DBY"] > thresholds.get('DBY', 0):
+                return "Male"
+            return "Unknown"
+
+        marker_expr["Inferred_Sex"] = marker_expr.apply(infer_sex, axis=1)
+
+        # Update metadata with inferred sex if original sex was 'Unknown'
+        for sample_id in marker_expr.index:
+            if sample_id in metadata.index and metadata.loc[sample_id, "Sex"] == "Unknown":
+                metadata.loc[sample_id, "Sex"] = marker_expr.loc[sample_id, "Inferred_Sex"]
+
+        num_fixed = (marker_expr["Inferred_Sex"] != "Unknown").sum()
+        logger.info(f"Inferred sex for {num_fixed} samples using expression markers")
+
+    def extract_sample_metadata(self, gse):
+        """Extract metadata from GSE samples, parsing for sex, disease, and age."""
+        metadata = {}
+
+        for gsm_name, gsm in gse.gsms.items():
+            sex = "Unknown"
+            disease = "Control"
+            age = None
+
+            characteristics = gsm.metadata.get('characteristics_ch1', [])
+            title = gsm.metadata.get('title', [''])[0].lower()
+
+            for char in characteristics:
+                char_lower = str(char).lower()
+
+                # Robustly find sex
+                if any(keyword in char_lower for keyword in ['sex:', 'gender:']):
+                    if 'male' in char_lower and 'female' not in char_lower:
+                        sex = "Male"
+                    elif 'female' in char_lower:
+                        sex = "Female"
+                elif 'male' in char_lower and 'female' not in char_lower:
+                    sex = "Male"
+                elif 'female' in char_lower:
+                    sex = "Female"
+
+                # Parse disease status
+                if any(keyword in char_lower for keyword in ['disease:', 'condition:', 'status:']):
+                    if any(term in char_lower for term in ['control', 'normal', 'healthy']):
+                        disease = "Control"
+                    elif any(term in char_lower for term in ['alzheimer', 'ad']):
+                        disease = "Alzheimer's"
+                    elif any(term in char_lower for term in ['incipient', 'mild']):
+                        disease = "Incipient"
+                    elif 'moderate' in char_lower:
+                        disease = "Moderate"
+                    elif 'severe' in char_lower:
+                        disease = "Severe"
+
+                # Parse age
+                if 'age:' in char_lower:
+                    try:
+                        age_str = char_lower.split('age:')[1].strip()
+                        digits = ''.join(filter(str.isdigit, age_str))
+                        if digits:
+                            age = float(digits)
+                    except Exception as e:
+                        logger.warning(f"Failed to parse age for sample {gsm_name}: {e}")
+                        age = None
+
+            # Fallback for sex from title
+            if sex == "Unknown":
+                if 'male' in title and 'female' not in title:
+                    sex = "Male"
+                elif 'female' in title:
+                    sex = "Female"
+
+            metadata[gsm_name] = {
+                'Sex': sex,
+                'Disease': disease,
+                'Age': age,
+                'Dataset': None
+            }
+
+        return pd.DataFrame.from_dict(metadata, orient='index')
+
+    def clean_expression_data(self, expression_df):
+        """Clean and convert expression data to numeric format."""
+        logger.info("Cleaning expression data...")
+
+        expression_df = expression_df.replace(['NA', 'na', 'NULL', 'null', '', 'NaN', 'nan'], np.nan)
+
+        # Convert to numeric, coercing errors to NaN
+        expression_df = expression_df.apply(pd.to_numeric, errors='coerce')
+
+        initial_rows = len(expression_df)
+        expression_df = expression_df.dropna(how='all')
+        removed_rows = initial_rows - len(expression_df)
+        if removed_rows > 0:
+            logger.info(f"Removed {removed_rows} rows with all NaN values")
+
+        return expression_df
+    
+    def get_gene_symbol_mapping(self, platform):
+        """
+        Creates a mapping from probe ID to gene symbol for a given platform.
+        Prioritizes 'Gene Symbol' or similar columns.
+        """
+        gene_symbol_cols = [col for col in platform.table.columns if 'gene' in col.lower()]
+        
+        # Select the most suitable column for gene symbols
+        gene_col = None
+        for col in ['Gene Symbol', 'GENE_SYMBOL', 'gene_assignment', 'gene_name']:
+            if col in platform.table.columns:
+                gene_col = col
+                break
+        
+        if gene_col is None:
+             for col in gene_symbol_cols:
+                gene_col = col
+                break
+        
+        if gene_col is None:
+            logger.warning("Could not find a suitable gene symbol column.")
+            return {}
+
+        mapping = platform.table[[gene_col]].copy()
+        
+        # Clean and simplify the gene symbol entries
+        mapping[gene_col] = mapping[gene_col].str.split(' /// ').str[0].str.strip().str.upper()
+        mapping = mapping.loc[mapping[gene_col].str.len() > 0]
+        
+        return mapping[gene_col].to_dict()
+
+
+    def process_dataset(self, gse_id):
+
+        logger.info(f"Processing {gse_id}...")
+
+        try:
+            # Assuming get_GEO and extract_sample_metadata are handled elsewhere
+            # The line 'Sample_ID': gsm_id, was a syntax error and has been removed.
+            gse = GEOparse.get_GEO(geo=gse_id, destdir=str(DATA_DIR), silent=True)
+            self.dataset_gse_objects[gse_id] = gse # Store GSE object
+
+            metadata_df = self.extract_sample_metadata(gse)
+            metadata_df['Dataset'] = gse_id
+
+            platform = list(gse.gpls.values())[0]
+            il6_probes = self.get_il6_probes(platform)
+
+            if il6_probes.empty:
+                logger.warning(f"No IL6 probes found in {gse_id}")
+                return None, None
+
+            try:
+                expression_df = gse.pivot_samples("VALUE")
+                logger.info(f"Expression data shape: {expression_df.shape}")
+            except Exception as e:
+                logger.error(f"Error extracting expression data from {gse_id}: {e}")
+                return None, None
+
+            expression_df = self.clean_expression_data(expression_df)
+            full_expression_df = expression_df.copy() # Keep a copy for GSEA
+
+            if gse_id == "GSE2164":
+                self.infer_sex_from_expression(expression_df, metadata_df)
+
+            il6_probe_ids = il6_probes['ID'].values if 'ID' in il6_probes.columns else il6_probes.index.values
+            logger.info(f"Looking for IL6 probes: {il6_probe_ids}")
+
+            available_probes = [probe for probe in il6_probe_ids if probe in expression_df.index]
+            logger.info(f"Found {len(available_probes)} IL6 probes: {available_probes}")
+
+            if not available_probes:
+                logger.warning(f"IL6 probes not found in expression data for {gse_id}")
+                return None, None
+
+            il6_expr = expression_df.loc[available_probes].copy()
+
+            if len(available_probes) > 1:
+                logger.info("Averaging multiple IL6 probes...")
+                il6_expr = il6_expr.mean(axis=0, skipna=True).to_frame().T
+                il6_expr.index = ['IL6_mean']
+
+            il6_expr = il6_expr.T
+            il6_expr.columns = ['IL6_Expression']
+
+            initial_samples = len(il6_expr)
+            il6_expr = il6_expr.dropna(subset=['IL6_Expression'])
+            removed_samples = initial_samples - len(il6_expr)
+            if removed_samples > 0:
+                logger.info(f"Removed {removed_samples} samples with NaN IL6 expression")
+
+            infinite_mask = ~np.isfinite(il6_expr['IL6_Expression'])
+            if infinite_mask.any():
+                logger.warning(f"Found {infinite_mask.sum()} infinite values, removing...")
+                il6_expr = il6_expr[~infinite_mask]
+
+            logger.info(f"Merging IL6 expression ({len(il6_expr)} samples) with metadata ({len(metadata_df)} samples)")
+            merged = il6_expr.merge(metadata_df, left_index=True, right_index=True, how='inner')
+            logger.info(f"After merge: {len(merged)} samples")
+
+            # FIX: Reset the index and rename the new column to 'Sample_ID'
+            merged = merged.reset_index().rename(columns={'index': 'Sample_ID'})
+
+            if len(merged) == 0:
+                logger.warning(f"No samples remained after merging for {gse_id}")
+                return None, None
+
+            severity_map = {'Control': 0, 'Incipient': 1, 'Moderate': 2, 'Severe': 3, "Alzheimer's": 3}
+            merged['Severity_Score'] = merged['Disease'].map(severity_map).fillna(0)
+
+            if not pd.api.types.is_numeric_dtype(merged['IL6_Expression']):
+                logger.error(f"IL6_Expression is not numeric! Converting again...")
+                merged['IL6_Expression'] = pd.to_numeric(merged['IL6_Expression'], errors='coerce')
+                merged = merged.dropna(subset=['IL6_Expression'])
+
+            logger.info(f"Successfully processed {gse_id}: {len(merged)} samples")
+            logger.info(f"Disease distribution: {dict(merged['Disease'].value_counts())}")
+            logger.info(f"Sex distribution: {dict(merged['Sex'].value_counts())}")
+
+            return merged, full_expression_df
+
+        except Exception as e:
+            logger.error(f"Error processing {gse_id}: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return None, None
+
+    def analyze_all_datasets(self):
+        """Process all datasets, combine results, and run visualizations and GSEA."""
+        logger.info("Starting analysis of all datasets...")
+
+        # Use tqdm for a progress bar during dataset processing
+        for gse_id in tqdm(GSE_IDS, desc="Processing Datasets"):
+            dataset_result, expression_df = self.process_dataset(gse_id)
+            if dataset_result is not None:
+                self.il6_data.append(dataset_result)
+                self.all_expression_data[gse_id] = expression_df
+
+        if not self.il6_data:
+            raise ValueError("No datasets were successfully processed!")
+
+        logger.info("Combining datasets...")
+        self.combined_data = pd.concat(self.il6_data, axis=0, ignore_index=True)
+        logger.info(f"Combined IL6 data shape: {self.combined_data.shape}")
+        
+        self.combined_data = self.final_data_cleaning()
+
+        self.create_all_visualizations()
+        self.run_gsea_on_il6_extremes()
+
+        return self.combined_data
+
+    def final_data_cleaning(self):
+        """Perform final comprehensive data cleaning on the combined dataset."""
+        logger.info("Performing final data cleaning...")
+
+        initial_size = len(self.combined_data)
+        self.combined_data = self.combined_data.dropna(subset=['IL6_Expression'])
+        logger.info(f"Removed {initial_size - len(self.combined_data)} rows with missing IL6 expression")
+
+        unknown_sex_data = self.combined_data[~self.combined_data['Sex'].isin(['Male', 'Female'])]
+        if len(unknown_sex_data) > 0:
+            logger.warning(f"Found {len(unknown_sex_data)} samples with unknown sex:")
+            for dataset in unknown_sex_data['Dataset'].unique():
+                count = len(unknown_sex_data[unknown_sex_data['Dataset'] == dataset])
+                logger.warning(f"  {dataset}: {count} samples")
+
+        logger.info("Final numeric validation...")
+        if self.combined_data['IL6_Expression'].dtype == 'object':
+            logger.warning("IL6_Expression is still object type, forcing numeric conversion...")
+            self.combined_data['IL6_Expression'] = pd.to_numeric(
+                self.combined_data['IL6_Expression'], errors='coerce'
+            )
+            self.combined_data = self.combined_data.dropna(subset=['IL6_Expression'])
+
+        finite_mask = np.isfinite(self.combined_data['IL6_Expression'])
+        infinite_count = (~finite_mask).sum()
+        if infinite_count > 0:
+            logger.warning(f"Removing {infinite_count} infinite values")
+            self.combined_data = self.combined_data[finite_mask]
+
+        if len(self.combined_data) == 0:
+            raise ValueError("No valid data remaining after cleaning!")
+
+        logger.info(f"Final clean dataset: {len(self.combined_data)} samples")
+        expr_values = self.combined_data['IL6_Expression']
+        logger.info(f"IL6 expression range: {expr_values.min():.2f} to {expr_values.max():.2f}")
+        logger.info(f"Combined analysis ready: {len(self.combined_data)} samples from {len(self.il6_data)} datasets")
+
+        return self.combined_data
+
+    def create_all_visualizations(self):
+        """Create all visualization types."""
+        plt.style.use('default')
+        sns.set_palette("husl")
+
+        self.create_bar_graph()
+        self.create_line_graph()
+        self.create_scatter_plot()
+        self.create_histogram()
+        self.create_violin_plot()
+
+        logger.info("All visualizations created successfully!")
+
+    def create_bar_graph(self):
+        """Create bar graph of mean IL6 expression by disease and sex."""
+        if len(self.combined_data) == 0:
+            logger.warning("No data available for bar graph")
+            return
+
+        sex_data = self.combined_data[self.combined_data['Sex'].isin(['Male', 'Female'])]
+        if len(sex_data) == 0:
+            logger.warning("No samples with known sex for bar graph")
+            return
+
+        plt.figure(figsize=(12, 8))
+
+        try:
+            grouped_data = sex_data.groupby(['Disease', 'Sex'])['IL6_Expression'].agg(['mean', 'std', 'count']).reset_index()
+            grouped_data['std'] = grouped_data['std'].fillna(0)
+            grouped_data['std'] = np.where(grouped_data['count'] < 2, 0, grouped_data['std'])
+
+            diseases = sorted(grouped_data['Disease'].unique())
+            x = np.arange(len(diseases))
+            width = 0.35
+
+            male_data = []
+            female_data = []
+
+            for disease in diseases:
+                male_row = grouped_data[(grouped_data['Disease'] == disease) & (grouped_data['Sex'] == 'Male')]
+                female_row = grouped_data[(grouped_data['Disease'] == disease) & (grouped_data['Sex'] == 'Female')]
+
+                male_data.append({
+                    'mean': male_row['mean'].iloc[0] if len(male_row) > 0 else 0,
+                    'std': male_row['std'].iloc[0] if len(male_row) > 0 else 0,
+                    'count': male_row['count'].iloc[0] if len(male_row) > 0 else 0
+                })
+
+                female_data.append({
+                    'mean': female_row['mean'].iloc[0] if len(female_row) > 0 else 0,
+                    'std': female_row['std'].iloc[0] if len(female_row) > 0 else 0,
+                    'count': female_row['count'].iloc[0] if len(female_row) > 0 else 0
+                })
+
+            male_means = [d['mean'] for d in male_data]
+            male_stds = [d['std'] for d in male_data]
+            female_means = [d['mean'] for d in female_data]
+            female_stds = [d['std'] for d in female_data]
+
+            male_x = [i - width/2 for i, d in enumerate(male_data) if d['count'] > 0]
+            female_x = [i + width/2 for i, d in enumerate(female_data) if d['count'] > 0]
+
+            if male_x:
+                male_means_filtered = [male_means[i] for i, d in enumerate(male_data) if d['count'] > 0]
+                male_stds_filtered = [male_stds[i] for i, d in enumerate(male_data) if d['count'] > 0]
+                plt.bar(male_x, male_means_filtered, width, label='Male',
+                        color='#4472C4', alpha=0.8, yerr=male_stds_filtered, capsize=5)
+
+            if female_x:
+                female_means_filtered = [female_means[i] for i, d in enumerate(female_data) if d['count'] > 0]
+                female_stds_filtered = [female_stds[i] for i, d in enumerate(female_data) if d['count'] > 0]
+                plt.bar(female_x, female_means_filtered, width, label='Female',
+                        color='#E15759', alpha=0.8, yerr=female_stds_filtered, capsize=5)
+
+            plt.xlabel('Disease Status', fontsize=12, fontweight='bold')
+            plt.ylabel('Mean IL-6 Expression Level', fontsize=12, fontweight='bold')
+            plt.title('IL-6 Expression Levels by Disease Status and Sex\n(Mean ± Standard Deviation)',
+                      fontsize=14, fontweight='bold')
+            plt.xticks(x, diseases, rotation=45, ha='right')
+            plt.legend()
+            plt.grid(axis='y', alpha=0.3)
+            plt.tight_layout()
+
+            plt.savefig(OUTPUT_DIR / "il6_bar_graph.png", dpi=300, bbox_inches='tight')
+            plt.show()
+
+        except Exception as e:
+            logger.error(f"Error creating bar graph: {e}")
+            plt.close()
+
+    def create_line_graph(self):
+        """Create line graph showing IL6 expression trends."""
+        if len(self.combined_data) == 0:
+            logger.warning("No data available for line graph")
+            return
+
+        sex_data = self.combined_data[self.combined_data['Sex'].isin(['Male', 'Female'])]
+        if len(sex_data) == 0:
+            logger.warning("No samples with known sex for line graph")
+            return
+
+        plt.figure(figsize=(12, 8))
+
+        try:
+            line_data = sex_data.groupby(['Severity_Score', 'Sex'])['IL6_Expression'].agg(['mean', 'std', 'count']).reset_index()
+
+            for sex in ['Male', 'Female']:
+                sex_line_data = line_data[line_data['Sex'] == sex]
+                if len(sex_line_data) == 0:
+                    continue
+
+                color = '#4472C4' if sex == 'Male' else '#E15759'
+
+                sex_line_data = sex_line_data.sort_values('Severity_Score')
+
+                x_vals = sex_line_data['Severity_Score'].values
+                y_vals = sex_line_data['mean'].values
+                std_vals = sex_line_data['std'].fillna(0).values
+
+                plt.plot(x_vals, y_vals, marker='o', linewidth=3, markersize=8, label=sex, color=color)
+                plt.fill_between(x_vals, y_vals - std_vals, y_vals + std_vals, alpha=0.2, color=color)
+
+            plt.xlabel('Disease Severity Score', fontsize=12, fontweight='bold')
+            plt.ylabel('Mean IL-6 Expression Level', fontsize=12, fontweight='bold')
+            plt.title('IL-6 Expression Trends Across Disease Severity Levels',
+                      fontsize=14, fontweight='bold')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.xticks([0, 1, 2, 3], ['Control', 'Incipient', 'Moderate', 'Severe'])
+            plt.tight_layout()
+
+            plt.savefig(OUTPUT_DIR / "il6_line_graph.png", dpi=300, bbox_inches='tight')
+            plt.show()
+
+        except Exception as e:
+            logger.error(f"Error creating line graph: {e}")
+            plt.close()
+
+    def create_scatter_plot(self):
+        """Create scatter plot of IL6 expression vs severity with sex differentiation."""
+        if len(self.combined_data) == 0:
+            logger.warning("No data available for scatter plot")
+            return
+
+        sex_data = self.combined_data[self.combined_data['Sex'].isin(['Male', 'Female'])]
+        if len(sex_data) == 0:
+            logger.warning("No samples with known sex for scatter plot")
+            return
+
+        plt.figure(figsize=(12, 8))
+
+        try:
+            jittered_data = sex_data.copy()
+            np.random.seed(42)
+            jittered_data['Severity_Jittered'] = (
+                jittered_data['Severity_Score'] +
+                np.random.normal(0, 0.05, len(jittered_data))
+            )
+
+            # Scatterplots
+            for sex in ['Male', 'Female']:
+                sex_scatter_data = jittered_data[jittered_data['Sex'] == sex]
+                if len(sex_scatter_data) == 0:
+                    continue
+
+                color = '#4472C4' if sex == 'Male' else '#E15759'
+
+                x_vals = sex_scatter_data['Severity_Jittered'].values
+                y_vals = sex_scatter_data['IL6_Expression'].values
+
+                plt.scatter(x_vals, y_vals, alpha=0.6, s=60, label=sex, color=color)
+
+            if len(sex_data) > 2:
+                x_trend = sex_data['Severity_Score'].values
+                y_trend = sex_data['IL6_Expression'].values
+
+                slope, intercept, r_value, p_value, std_err = linregress(x_trend, y_trend)
+
+                line_x = np.array([0, 3])
+                line_y = slope * line_x + intercept
+                plt.plot(line_x, line_y, 'k--', alpha=0.8, linewidth=2)
+
+                plt.title(f'IL-6 Expression vs Disease Severity\n(R² = {r_value**2:.3f}, p = {p_value:.3e})',
+                          fontsize=14, fontweight='bold')
+            else:
+                plt.title('IL-6 Expression vs Disease Severity', fontsize=14, fontweight='bold')
+
+            plt.xlabel('Disease Severity Score', fontsize=12, fontweight='bold')
+            plt.ylabel('IL-6 Expression Level', fontsize=12, fontweight='bold')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.xticks([0, 1, 2, 3], ['Control', 'Incipient', 'Moderate', 'Severe'])
+            plt.tight_layout()
+
+            plt.savefig(OUTPUT_DIR / "il6_scatter_plot.png", dpi=300, bbox_inches='tight')
+            plt.show()
+
+        except Exception as e:
+            logger.error(f"Error creating scatter plot: {e}")
+            plt.close()
+
+    def create_histogram(self):
+        """Create histogram showing distribution of IL6 expression."""
+        if len(self.combined_data) == 0:
+            logger.warning("No data available for histogram")
+            return
+
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+
+            il6_values = self.combined_data['IL6_Expression'].values
+
+            axes[0, 0].hist(il6_values, bins=50, alpha=0.7,
+                            color='skyblue', edgecolor='black')
+            axes[0, 0].set_title('Overall IL-6 Expression Distribution', fontweight='bold')
+            axes[0, 0].set_xlabel('IL-6 Expression Level')
+            axes[0, 0].set_ylabel('Frequency')
+            axes[0, 0].grid(True, alpha=0.3)
+
+            sex_data = self.combined_data[self.combined_data['Sex'].isin(['Male', 'Female'])]
+            sex_counts = sex_data['Sex'].value_counts()
+
+            if len(sex_counts) > 1:
+                male_values = sex_data[sex_data['Sex'] == 'Male']['IL6_Expression'].values
+                female_values = sex_data[sex_data['Sex'] == 'Female']['IL6_Expression'].values
+
+                hist_data = []
+                hist_labels = []
+                hist_colors = []
+
+                if len(male_values) > 0:
+                    hist_data.append(male_values)
+                    hist_labels.append('Male')
+                    hist_colors.append('#4472C4')
+                if len(female_values) > 0:
+                    hist_data.append(female_values)
+                    hist_labels.append('Female')
+                    hist_colors.append('#E15759')
+
+                if hist_data:
+                    axes[0, 1].hist(hist_data, bins=30, alpha=0.7,
+                                    label=hist_labels, color=hist_colors)
+                    axes[0, 1].legend()
+                    axes[0, 1].set_title('IL-6 Expression Distribution by Sex', fontweight='bold')
+                else:
+                    axes[0, 1].hist(il6_values, bins=30, alpha=0.7, color='skyblue')
+                    axes[0, 1].set_title('IL-6 Expression Distribution\n(No Sex Data)', fontweight='bold')
+            else:
+                axes[0, 1].hist(il6_values, bins=30, alpha=0.7, color='skyblue')
+                axes[0, 1].set_title('IL-6 Expression Distribution\n(Single/Unknown Sex)', fontweight='bold')
+
+            axes[0, 1].set_xlabel('IL-6 Expression Level')
+            axes[0, 1].set_ylabel('Frequency')
+            axes[0, 1].grid(True, alpha=0.3)
+
+            diseases = self.combined_data['Disease'].unique()
+            disease_data = []
+            disease_labels = []
+
+            for disease in sorted(diseases):
+                disease_values = self.combined_data[self.combined_data['Disease'] == disease]['IL6_Expression'].values
+                if len(disease_values) > 0:
+                    disease_data.append(disease_values)
+                    disease_labels.append(disease)
+
+            if disease_data:
+                axes[1, 0].hist(disease_data, bins=25, alpha=0.7, label=disease_labels)
+                axes[1, 0].legend()
+            else:
+                axes[1, 0].hist(il6_values, bins=25, alpha=0.7, color='skyblue')
+
+            axes[1, 0].set_title('IL-6 Expression Distribution by Disease', fontweight='bold')
+            axes[1, 0].set_xlabel('IL-6 Expression Level')
+            axes[1, 0].set_ylabel('Frequency')
+            axes[1, 0].grid(True, alpha=0.3)
+
+            datasets = self.combined_data['Dataset'].unique()
+            dataset_data = []
+            dataset_labels = []
+
+            for dataset in sorted(datasets):
+                dataset_values = self.combined_data[self.combined_data['Dataset'] == dataset]['IL6_Expression'].values
+                if len(dataset_values) > 0:
+                    dataset_data.append(dataset_values)
+                    dataset_labels.append(dataset)
+
+            if dataset_data:
+                axes[1, 1].hist(dataset_data, bins=25, alpha=0.7, label=dataset_labels)
+                axes[1, 1].legend(fontsize=8)
+            else:
+                axes[1, 1].hist(il6_values, bins=25, alpha=0.7, color='skyblue')
+
+            axes[1, 1].set_title('IL-6 Expression Distribution by Dataset', fontweight='bold')
+            axes[1, 1].set_xlabel('IL-6 Expression Level')
+            axes[1, 1].set_ylabel('Frequency')
+            axes[1, 1].grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.savefig(OUTPUT_DIR / "il6_histograms.png", dpi=300, bbox_inches='tight')
+            plt.show()
+
+        except Exception as e:
+            logger.error(f"Error creating histogram: {e}")
+            plt.close('all')
+
+    def create_violin_plot(self):
+        """Create violin plot showing IL6 expression distribution by sex and severity."""
+        data = self.combined_data.copy()
+        data = data[data['Sex'].isin(['Male', 'Female'])]
+        if data.empty:
+            logger.warning("No valid data for violin plot")
+            return
+
+        plt.figure(figsize=(12, 8))
+        try:
+            sns.violinplot(x="Severity_Score", y="IL6_Expression", hue="Sex",
+                           data=data, split=True, inner="quart",
+                           palette={"Male": "#4472C4", "Female": "#E15759"})
+
+            plt.xlabel("Disease Severity Score", fontsize=12, fontweight='bold')
+            plt.ylabel("IL-6 Expression", fontsize=12, fontweight='bold')
+            plt.title("IL-6 Expression by Sex and Disease Stage", fontsize=14, fontweight='bold')
+            plt.xticks([0, 1, 2, 3], ['Control', 'Incipient', 'Moderate', 'Severe'])
+            plt.legend(title="Sex")
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(OUTPUT_DIR / "il6_violin_plot.png", dpi=300, bbox_inches='tight')
+            plt.show()
+        except Exception as e:
+            logger.error(f"Error creating violin plot: {e}")
+            plt.close()
+    
+    def run_gsea_on_il6_extremes(self):
+        """
+        Performs Gene Set Enrichment Analysis (GSEA) on the combined datasets
+        by comparing samples with high IL-6 expression to those with low IL-6 expression.
+        
+        This updated version performs GSEA per dataset to account for different
+        gene probe annotations and platforms.
+        """
+        if self.combined_data is None or not self.all_expression_data:
+            logger.error("Combined data not available for GSEA.")
+            return
+
+        logger.info("Starting GSEA on IL-6 expression extremes...")
+
+        # 1. Iterate through each dataset
+        for gse_id, expression_df in tqdm(self.all_expression_data.items(), desc="Running GSEA"):
+            try:
+                # Get the platform object for this specific GSE
+                gse = self.dataset_gse_objects.get(gse_id)
+                if gse is None:
+                    logger.warning(f"GSE object for {gse_id} not found. Skipping GSEA.")
+                    continue
+                platform = list(gse.gpls.values())[0]
+
+                # Get the gene symbol mapping for this platform
+                gene_map = self.get_gene_symbol_mapping(platform)
+                
+                # Check if mapping is empty
+                if not gene_map:
+                    logger.warning(f"No gene symbol mapping found for {gse_id}. Skipping GSEA.")
+                    continue
+                
+                # Create a gene symbol-indexed expression DataFrame
+                gsea_expression_df = expression_df.rename(index=gene_map).dropna(how='all')
+                
+                # Remove any duplicated gene symbols by taking the mean of their expression
+                gsea_expression_df = gsea_expression_df.groupby(gsea_expression_df.index).mean()
+
+                # Get high and low IL-6 samples for this specific dataset
+                dataset_il6_data = self.combined_data[self.combined_data['Dataset'] == gse_id]
+                
+                if len(dataset_il6_data) < 30: # Minimum samples needed for GSEA
+                    logger.info(f"Fewer than 30 samples for {gse_id}. Skipping GSEA.")
+                    continue
+
+                high_il6_threshold = dataset_il6_data['IL6_Expression'].quantile(0.75)
+                low_il6_threshold = dataset_il6_data['IL6_Expression'].quantile(0.25)
+                
+                # CHANGED FROM .index.tolist() to ['Sample_ID'].tolist()
+                high_il6_samples = dataset_il6_data[
+                    dataset_il6_data['IL6_Expression'] >= high_il6_threshold
+                ]['Sample_ID'].tolist()
+
+                low_il6_samples = dataset_il6_data[
+                    dataset_il6_data['IL6_Expression'] <= low_il6_threshold
+                ]['Sample_ID'].tolist()
+
+                if not high_il6_samples or not low_il6_samples:
+                    logger.warning(f"Insufficient samples for high/low IL-6 groups in {gse_id}. Skipping GSEA.")
+                    continue
+
+                logger.info(f"High IL-6 group ({gse_id}): {len(high_il6_samples)} samples")
+                logger.info(f"Low IL-6 group ({gse_id}): {len(low_il6_samples)} samples")
+
+                # Prepare expression data and labels for gseapy
+                # We need to map the combined data index back to original sample IDs
+                original_sample_ids = dataset_il6_data.index
+                
+                # Filter the GSEA expression df to only include the samples we need
+                gsea_data_for_run = gsea_expression_df.loc[:, list(high_il6_samples) + list(low_il6_samples)]
+
+                # Create a label series for gseapy, indexed by sample IDs
+                labels = pd.Series('low_il6', index=gsea_data_for_run.columns)
+                labels.loc[high_il6_samples] = 'high_il6'
+                
+                gsea_output_subdir = GSEA_OUTPUT_DIR / gse_id
+                gsea_output_subdir.mkdir(exist_ok=True)
+                
+                logger.info(f"Running GSEA for {gse_id}...")
+                gs_res = gp.gsea(data=gsea_data_for_run,
+                                 gene_sets='KEGG_2021_Human',
+                                 cls=labels,
+                                 min_size=15,
+                                 max_size=500,
+                                 permutation_type='phenotype',
+                                 outdir=str(gsea_output_subdir),
+                                 seed=42)
+                logger.info(f"GSEA complete for {gse_id}.")
+                logger.info(gs_res)
+            
+            except Exception as e:
+                logger.error(f"Error during GSEA for {gse_id}: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        logger.info("All GSEA analyses finished.")
+
+# --- Main Execution Block ---
+
+if __name__ == "__main__":
+    try:
+        analyzer = IL6Analyzer()
+        final_data = analyzer.analyze_all_datasets()
+        logger.info("Analysis complete.")
+    except Exception as e:
+        logger.error(f"The main analysis failed: {e}")
